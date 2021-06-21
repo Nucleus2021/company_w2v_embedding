@@ -47,10 +47,11 @@ def generate_company_pairs_list(data: list, company_index: dict) -> (dict, list)
 
     return pairs_count, companies_pairs
 
-def generate_index(data: list) -> (dict, dict, dict):
+def generate_index(data: list, output_name: str) -> (dict, dict, dict):
     """
     Generate company-index, index-company pairs
     :param data: All possible companies
+    :param output_name: output filename suffix
     :return company_index: company-index mapping
     :return index_company: index-company mapping
     """
@@ -67,9 +68,9 @@ def generate_index(data: list) -> (dict, dict, dict):
     companies_count = {k:v for k,v in sorted(companies_count.items(), key = lambda item:item[0])}
 
     # Save mappings to disk
-    save_mapping(company_index, '../data/company_index.pickle')
-    save_mapping(index_company, '../data/index_company.pickle')
-    save_mapping(companies_count, '../data/companies_count.pickle')
+    save_mapping(company_index, '../data/company_index_' + output_name + '.pickle')
+    save_mapping(index_company, '../data/index_company_' + output_name + '.pickle')
+    save_mapping(companies_count, '../data/companies_count_' + output_name + '.pickle')
 
     return company_index, index_company, companies_count
 
@@ -101,7 +102,7 @@ def generate_val_company_pairs_list(val_data: list, val_company_list: list, comp
     val_companies_pairs = set(val_companies_pairs) - set(companies_pairs)
     return val_companies_pairs
 
-def name_embedding_model(company_index, pairs_count, lr=0.001, embedding_size=64):
+def name_embedding_model(company_index, pairs_count, lr=0.01, embedding_size=64, seed=1):
     """
     Model to embed skills and titles using the functional API.
     Trained to discern if a title is present in a the skill
@@ -111,6 +112,10 @@ def name_embedding_model(company_index, pairs_count, lr=0.001, embedding_size=64
     :return: keras model
     """
 
+    random.seed(seed)
+    np.random.seed(seed)
+    set_seed(seed)
+    
     # Both inputs are 1-dimensional
     target_company = Input(name='target', shape=[1])
     object_company = Input(name='object', shape=[1])
@@ -134,7 +139,7 @@ def name_embedding_model(company_index, pairs_count, lr=0.001, embedding_size=64
     merged = Dense(1, activation='sigmoid')(merged)
     model = Model(inputs=[target_company, object_company], outputs=merged)
 
-    model.compile(optimizer=SGD(learning_rate=lr), loss='categorical_crossentropy', metrics=['accuracy'])
+    model.compile(optimizer=SGD(learning_rate=lr), loss='binary_crossentropy', metrics=['accuracy'])
 
     return model
 
@@ -182,24 +187,24 @@ def generate_batch(companies_pairs: list, index_company: dict, pairs_count: dict
 
         # Make sure to shuffle order
         np.random.shuffle(batch)
-        yield {'target': batch[:, 0], 'object': batch[:, 1]}, batch[:, 2], batch[:, 3]
+        yield {'target': batch[:, 0], 'object': batch[:, 1]}, batch[:, 2].reshape(-1,1), batch[:, 3].reshape(-1,1)
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('-config', type=str, help='Name of the configuration file')
     return parser.parse_args()
 
-def train(args) -> list:
+def train() -> list:
     """
     Train the embedding model, save the company embedding
     :return: company embedding.
     """
     # load configuration from file
     config = configparser.ConfigParser()
-    config.read(args.config)
+    config.read('train_config.ini')
     # load {company: companies appear at the same time}
     data = load_data(config['DEFAULT']['data_path'])
-    val_data = load_data(config['DEFAULT']['val_data'])
+#     val_data = load_data(config['DEFAULT']['val_data'])
 
     # Generate index mappings
     company_index, index_company, companies_count = generate_index(data)
@@ -208,11 +213,12 @@ def train(args) -> list:
     pairs_count, companies_pairs = generate_company_pairs_list(data, company_index)
     
     # validation company list
-    val_company_list = val_company_in_train(val_data, company_index)
-    val_companies_pairs = generate_val_company_pairs_list(val_data, val_company_list, companies_pairs, company_index)
+#     val_company_list = val_company_in_train(val_data, company_index)
+#     val_companies_pairs = generate_val_company_pairs_list(val_data, val_company_list, companies_pairs, company_index)
+    
 
     # Instantiate model and show parameters
-    model = name_embedding_model(company_index, pairs_count, lr=float(config['DEFAULT']['learning_rate']), embedding_size=int(config['DEFAULT']['embedding_size']))
+    model = name_embedding_model(company_index, pairs_count, lr=float(config['DEFAULT']['learning_rate']), embedding_size=int(config['DEFAULT']['embedding_size']), seed=int(config['DEFAULT']['random_seed']))
     print(model.summary())
     n_positive = int(config['DEFAULT']['n_positive'])
     gen = generate_batch(companies_pairs, index_company, pairs_count, companies_count, n_positive,
@@ -221,20 +227,20 @@ def train(args) -> list:
     
     # Train
     epochs = int(config['DEFAULT']['epochs'])
-    log_dir = "../logs/fit/" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = "logs/fit/" + datetime.now().strftime("%Y%m%d-%H%M%S")
     tensorboard_callback = TensorBoard(log_dir="logs")
     
-    model.fit(gen, epochs=epochs, validation_data=val_companies_pairs,
-                        steps_per_epoch=len(companies_pairs) // n_positive,
-                        verbose=int(config['DEFAULT']['verbose']), callbacks=[tensorboard_callback])
+    hist=model.fit(gen, epochs=epochs,
+                steps_per_epoch=len(companies_pairs) // n_positive,
+                verbose=int(config['DEFAULT']['verbose']), callbacks=[tensorboard_callback]) # validation_data=val_companies_pairs,
 
     company_weights = extract_embedding(model)
 
     # save embeddings to disk.
-    save_embedding(company_weights, '../data/company_weights_' + args.config.split('.')[0] + '.npy')
+    save_embedding(company_weights, 'data/company_weights_frequent_800.npy')
 
-    return company_weights
+    return hist, company_weights, index_company
 
 if __name__ == '__main__':
     args = parse_args()
-    train(args)
+    hist, company_weights, index_company = train(args)
