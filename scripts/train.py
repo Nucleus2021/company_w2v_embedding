@@ -1,108 +1,28 @@
-"""Train company embedding using w2v"""
+"""Train company embedding using w2v
+    Usage:  python3 train.py -config train_config_long_competitors.ini
+    Author: Changpeng Lu
+"""
+
 import configparser
 import numpy as np
 import random
 import argparse
-from datetime import datetime
-from collections import defaultdict, Counter
+import tensorflow as tf
 from itertools import permutations
-from tensorflow.keras.layers import Input, Embedding, Dot, Reshape, Dense
+import ujson
+import numpy as np
+import pickle
+from datetime import datetime
+from tensorflow.keras.layers import Input, Embedding, Dot, Reshape, Dense, Layer
 from tensorflow.keras.models import Model
-from keras.optimizers import SGD
+from keras.optimizers import SGD, Adam
+from tensorflow.keras.losses import CategoricalCrossentropy
 from tensorflow.random import set_seed
-from tensorflow.keras.callbacks import TensorBoard
+from tensorflow.keras.callbacks import TensorBoard, ModelCheckpoint
 
-from utils import load_data, save_mapping, save_embedding, chunks
+from gen_utils import *
 
-def extract_embedding(model: Model) -> (list, list):
-    """
-    Extract embeddings from Keras model, save embedding to disk
-    :param model: Keras model
-    :return: skill embedding and title embedding
-    """
-    # Extract company embeddings
-    company_layer = model.get_layer('company_embedding')
-    company_weights = company_layer.get_weights()[0]
-
-    return company_weights
-
-def generate_company_pairs_list(data: list, company_index: dict) -> (dict, list):
-    """
-    Generate company pairs list from raw data
-    :param data: List of sets, raw json file
-    :param company_index: Companies - indices
-    :return pairs_count: pairs of company indices - freq
-    """
-    perm = [permutations(search, 2) for search in data]
-
-    pairs_count = defaultdict(int)
-    for iterate in perm:
-        for pair in iterate:
-            tmp_key = '-'.join([str(company_index[pair[0]]), str(company_index[pair[1]])])
-            if not tmp_key in pairs_count.keys():
-                pairs_count[tmp_key] = 1
-            else:
-                pairs_count[tmp_key] += 1
-    companies_pairs = [tuple(int(x) for x in key.split('-')) for key in pairs_count.keys()]
-
-    return pairs_count, companies_pairs
-
-def generate_index(data: list, output_name: str) -> (dict, dict, dict):
-    """
-    Generate company-index, index-company pairs
-    :param data: All possible companies
-    :param output_name: output filename suffix
-    :return company_index: company-index mapping
-    :return index_company: index-company mapping
-    """
-
-    companies = []
-    for search in data:
-        companies += search
-
-    company_index = {company: idx for idx, company in enumerate(set(companies))}
-    index_company = {idx: company for company, idx in company_index.items()}
-
-    companies_count = Counter(companies)
-    companies_count = {company_index[k]: v for k,v in companies_count.items()}
-    companies_count = {k:v for k,v in sorted(companies_count.items(), key = lambda item:item[0])}
-
-    # Save mappings to disk
-    save_mapping(company_index, '../data/company_index_' + output_name + '.pickle')
-    save_mapping(index_company, '../data/index_company_' + output_name + '.pickle')
-    save_mapping(companies_count, '../data/companies_count_' + output_name + '.pickle')
-
-    return company_index, index_company, companies_count
-
-def val_company_in_train(val_data: list, company_index: dict) -> list:
-    val_companies = []
-    for search in val_data:
-        val_companies += search
-        val_companies = list(set(val_companies))
-    val_company_list = []
-    for vc in val_companies:
-        if vc in company_index.keys():
-            val_company_list.append(vc)
-    return val_company_list
-
-def generate_val_company_pairs_list(val_data: list, val_company_list: list, companies_pairs: list, company_index: dict) -> list:
-    """
-    Generate validation company pairs list from val data
-    :param val_data: List of validation user search
-    :param val_company_list: List of target companies that in validation, also appear in training data
-    :param companies_pairs: Positive pairs for training
-    :return val_companies_pairs: companies pairs for validation
-    """
-    perm = [permutations(search, 2) for search in val_data if set(search) & set(val_company_list) != set()]
-    val_companies_pairs = []
-    for iterate in perm:
-        for pair in iterate:
-            if (pair[0] in val_company_list) & (pair[1] in val_company_list):
-                val_companies_pairs.append(tuple([company_index[pair[0]], company_index[pair[1]]]))
-    val_companies_pairs = set(val_companies_pairs) - set(companies_pairs)
-    return val_companies_pairs
-
-def name_embedding_model(company_index, pairs_count, lr=0.01, embedding_size=64, seed=1):
+def company_embedding_w2v_model(company_index, lr=0.01, embedding_size=64, seed=1):
     """
     Model to embed skills and titles using the functional API.
     Trained to discern if a title is present in a the skill
@@ -115,19 +35,22 @@ def name_embedding_model(company_index, pairs_count, lr=0.01, embedding_size=64,
     random.seed(seed)
     np.random.seed(seed)
     set_seed(seed)
-    
+
     # Both inputs are 1-dimensional
     target_company = Input(name='target', shape=[1])
     object_company = Input(name='object', shape=[1])
 
     # Embedding the target company (shape will be (None, 1, 64))
-    embedding = Embedding(name='company_embedding',
+    input_embedding = Embedding(name='company_embedding',
+                                input_dim=len(company_index),
+                                output_dim=embedding_size)
+    output_embedding = Embedding(name='weight',
                                 input_dim=len(company_index),
                                 output_dim=embedding_size)
 
     # Embedding the object company (shape will be (None, 1, 64))
-    target_embedding = embedding(target_company)
-    object_embedding = embedding(object_company)
+    target_embedding = input_embedding(target_company)
+    object_embedding = output_embedding(object_company)
 
     # Merge the layers with a dot product along the second axis (shape will be (None, 1, 1))
     merged = Dot(name='dot_product', normalize=True, axes=2)([target_embedding, object_embedding])
@@ -143,103 +66,90 @@ def name_embedding_model(company_index, pairs_count, lr=0.01, embedding_size=64,
 
     return model
 
-def generate_batch(companies_pairs: list, index_company: dict, pairs_count: dict, companies_count:dict,
-                   n_positive: int = 1, n_negative: int = 5, seed: int = 100):
-    """
-    Generate batches of samples for training
-    :param companies_pairs: Positive pairs
-    :param index_company: index-company mapping
-    :param pairs_count: weights for each positive pair
-    :param n_positive:
-    :param n_negative:
-    :param seed:
-    :return:
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    set_seed(seed)
-    batch_size = int(n_positive * (1 + n_negative))
-    batch = np.zeros((batch_size, 4))
-
-    total_count = sum(companies_count.values())
-    companies_freq = {k: v / total_count for k,v in companies_count.items()}
-    
-    
-    for positive_per_batch in chunks(companies_pairs, n_positive):
-        # This creates a generator
-        idx = 0
-        for (target_company, object_company) in positive_per_batch:
-            weight_of_pair = pairs_count['-'.join([str(target_company), str(object_company)])]
-            batch[idx, :] = (target_company, object_company, 1, weight_of_pair)
-            # Increment idx by 1
-            idx += 1
-            # Add negative examples until reach batch size
-            k = 0
-            while k < n_negative:
-                # negative selection based on unigram ^ (3/4)
-                negative_company = random.choices(population=range(len(index_company)), weights=[x**(3/4) for x in companies_freq.values()], k=1)[0]
-                # Check to make sure this is not a positive example
-                if (target_company, negative_company) not in companies_pairs:
-                    k += 1
-                    weight_of_pair = pairs_count['-'.join([str(target_company), str(object_company)])]
-                    batch[idx, :] = (target_company, negative_company, 0, weight_of_pair)
-                    idx += 1
-
-        # Make sure to shuffle order
-        np.random.shuffle(batch)
-        yield {'target': batch[:, 0], 'object': batch[:, 1]}, batch[:, 2].reshape(-1,1), batch[:, 3].reshape(-1,1)
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-config', type=str, help='Name of the configuration file')
-    return parser.parse_args()
-
-def train() -> list:
+def train(args) -> list:
     """
     Train the embedding model, save the company embedding
     :return: company embedding.
     """
     # load configuration from file
     config = configparser.ConfigParser()
-    config.read('train_config.ini')
+    config.read(args.config)
     # load {company: companies appear at the same time}
     data = load_data(config['DEFAULT']['data_path'])
 #     val_data = load_data(config['DEFAULT']['val_data'])
-
+    if config['DEFAULT']['whole_data'] != 'None':
+        whole_data = load_data(config['DEFAULT']['whole_data'])
+        tag_whole = True
+    else:
+        tag_whole = False
+    output_name = config['DEFAULT']['output_name']
     # Generate index mappings
-    company_index, index_company, companies_count = generate_index(data)
-    
+    load_path = config['DEFAULT']['load_path']
+    if load_path == 'None':
+        company_index, index_company, companies_count = generate_index(data, output_name)
+    else:
+        company_index = pkl.load(open(os.path.join(load_path, 'company_index_' + output_name + '.pickle'), 'rb'))
+        index_company = pkl.load(open(os.path.join(load_path, 'index_company_' + output_name + '.pickle'), 'rb'))
+        companies_count = pkl.load(open(os.path.join(load_path, 'companies_count_' + output_name + '.pickle'), 'rb'))
+
+
     # Generate company pairs with counts
     pairs_count, companies_pairs = generate_company_pairs_list(data, company_index)
-    
+
     # validation company list
 #     val_company_list = val_company_in_train(val_data, company_index)
 #     val_companies_pairs = generate_val_company_pairs_list(val_data, val_company_list, companies_pairs, company_index)
-    
 
+    checkpoint_path = config['DEFAULT']['checkpoint_path']
     # Instantiate model and show parameters
-    model = name_embedding_model(company_index, pairs_count, lr=float(config['DEFAULT']['learning_rate']), embedding_size=int(config['DEFAULT']['embedding_size']), seed=int(config['DEFAULT']['random_seed']))
+    if checkpoint_path == 'None':
+        model = company_embedding_w2v_model(company_index, lr=float(config['DEFAULT']['learning_rate']), embedding_size=int(config['DEFAULT']['embedding_size']), seed=int(config['DEFAULT']['random_seed']))
+    else:
+        model = tf.keras.models.load_model(checkpoint_path)
+
     print(model.summary())
     n_positive = int(config['DEFAULT']['n_positive'])
-    gen = generate_batch(companies_pairs, index_company, pairs_count, companies_count, n_positive,
+
+    num_positives = int(config['DEFAULT']['num_positives'])
+    if num_positives != 0:
+        if load_path == 'None':
+            companies_pairs = random.choices(population=companies_pairs, weights=pairs_count.values(), k=num_positives)
+            save_mapping(companies_pairs, 'data/companies_pairs_filtered_' + output_name + '.pickle')
+        else:
+            companies_pairs = pkl.load(open(os.path.join(load_path, 'companies_pairs_filtered_' + output_name + '.pickle'), 'rb'))
+    else:
+        companies_pairs = companies_pairs
+    if tag_whole == True:
+        gen = generate_batch(companies_pairs, index_company, pairs_count, companies_count,
+                         whole_data, n_positive,
                          n_negative=int(config['DEFAULT']['n_negative']),
                          seed=int(config['DEFAULT']['random_seed']))
-    
+    else:
+        gen = generate_batch_clean(companies_pairs, index_company, pairs_count, companies_count,
+                         n_positive,
+                         n_negative=int(config['DEFAULT']['n_negative']),
+                         seed=int(config['DEFAULT']['random_seed']))
+
     # Train
     epochs = int(config['DEFAULT']['epochs'])
     log_dir = "logs/fit/" + datetime.now().strftime("%Y%m%d-%H%M%S")
     tensorboard_callback = TensorBoard(log_dir="logs")
-    
+    weights_callback = ModelCheckpoint('logs/checkpoint_{epoch: 02d}_{accuracy:.2f}.hdf5', monitor='accuracy')
     hist=model.fit(gen, epochs=epochs,
                 steps_per_epoch=len(companies_pairs) // n_positive,
-                verbose=int(config['DEFAULT']['verbose']), callbacks=[tensorboard_callback]) # validation_data=val_companies_pairs,
+                verbose=int(config['DEFAULT']['verbose']), callbacks=[weights_callback, tensorboard_callback]) # validation_data=val_companies_pairs,
 
     company_weights = extract_embedding(model)
 
     # save embeddings to disk.
-    save_embedding(company_weights, 'data/company_weights_frequent_800.npy')
+    save_embedding(company_weights, 'data/company_weights_' + output_name + '.npy')
 
     return hist, company_weights, index_company
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-config', type=str, help='Name of the configuration file')
+    return parser.parse_args()
 
 if __name__ == '__main__':
     args = parse_args()
